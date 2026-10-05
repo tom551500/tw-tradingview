@@ -20,7 +20,17 @@ POPULAR = {
     "國泰永續高股息 00878": "00878",
 }
 
-PERIODS = {"日 K": "D", "週 K": "W", "月 K": "M"}
+# 週期：分K 需要 FinMind 付費權限；日K 以上免費
+PERIODS = {
+    "1 分": "1m",
+    "30 分": "30m",
+    "60 分": "60m",
+    "日 K": "D",
+    "3 日 K": "3D",
+    "週 K": "W",
+    "月 K": "M",
+}
+INTRADAY = {"1m": 1, "30m": 30, "60m": 60}
 
 # 主圖疊加指標 / 副圖指標（KLineChart 內建名稱）
 MAIN_INDICATORS = {"均線 MA": "MA", "均線 EMA": "EMA", "布林通道": "BOLL"}
@@ -32,14 +42,17 @@ except Exception:
     DEFAULT_TOKEN = ""
 
 
+def _headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 # ---------------------------------------------------------------
-# 資料
+# 日線資料
 # ---------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="讀取 FinMind 資料中…")
+@st.cache_data(ttl=3600, show_spinner="讀取 FinMind 日線資料中…")
 def load_price(code: str, start: str, token: str) -> pd.DataFrame:
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
     params = {"dataset": "TaiwanStockPrice", "data_id": code, "start_date": start}
-    r = requests.get(FINMIND_URL, params=params, headers=headers, timeout=30)
+    r = requests.get(FINMIND_URL, params=params, headers=_headers(token), timeout=30)
     j = r.json()
     if j.get("status") != 200:
         raise RuntimeError(j.get("msg", "FinMind 回傳錯誤"))
@@ -56,31 +69,101 @@ def load_price(code: str, start: str, token: str) -> pd.DataFrame:
 @st.cache_data(ttl=86400)
 def load_name(code: str, token: str) -> str:
     try:
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
         params = {"dataset": "TaiwanStockInfo", "data_id": code}
-        j = requests.get(FINMIND_URL, params=params, headers=headers, timeout=20).json()
+        j = requests.get(FINMIND_URL, params=params, headers=_headers(token), timeout=20).json()
         rows = j.get("data", [])
         return rows[0].get("stock_name", "") if rows else ""
     except Exception:
         return ""
 
 
-def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
-    if rule == "D" or df.empty:
+# ---------------------------------------------------------------
+# 分K 資料（FinMind TaiwanStockKBar，需付費權限）
+# ---------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner=False)
+def load_kbar_day(code: str, day: str, token: str) -> pd.DataFrame:
+    params = {"dataset": "TaiwanStockKBar", "data_id": code, "start_date": day, "end_date": day}
+    r = requests.get(FINMIND_URL, params=params, headers=_headers(token), timeout=30)
+    j = r.json()
+    if j.get("status") != 200:
+        raise RuntimeError(j.get("msg", "FinMind 回傳錯誤"))
+    df = pd.DataFrame(j.get("data", []))
+    if df.empty:
         return df
-    key = df["date"].dt.to_period("W-FRI" if rule == "W" else "M")
-    return (
+    df = df.rename(columns={"max": "high", "min": "low", "Trading_Volume": "volume"})
+    time_col = "minute" if "minute" in df.columns else ("time" if "time" in df.columns else None)
+    need = {"date", "open", "high", "low", "close", "volume"}
+    if time_col is None or not need.issubset(df.columns):
+        raise RuntimeError(f"分K 欄位與預期不同：{list(df.columns)}")
+    df["dt"] = pd.to_datetime(df["date"].astype(str) + " " + df[time_col].astype(str))
+    return df[["dt", "open", "high", "low", "close", "volume"]]
+
+
+def load_kbar(code: str, ndays: int, token: str) -> pd.DataFrame:
+    frames, got, tries = [], 0, 0
+    day = pd.Timestamp.today().normalize()
+    while got < ndays and tries < ndays * 2 + 10:
+        if day.weekday() < 5:
+            d = load_kbar_day(code, day.strftime("%Y-%m-%d"), token)
+            if not d.empty:
+                frames.append(d)
+                got += 1
+        day -= pd.Timedelta(days=1)
+        tries += 1
+    if not frames:
+        return pd.DataFrame()
+    df = pd.concat(frames).sort_values("dt").reset_index(drop=True)
+    return df[(df["open"] > 0) & (df["close"] > 0)]
+
+
+def to_intraday_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    if minutes == 1:
+        return df.rename(columns={"dt": "date"})
+    # 若資料時間標在「該分鐘結束」(最早一筆 ≥ 09:01)，分組前先往前移 1 分鐘
+    tod = df["dt"].dt.hour * 60 + df["dt"].dt.minute
+    shift = pd.Timedelta(minutes=1) if tod.min() >= 9 * 60 + 1 else pd.Timedelta(0)
+    key = (df["dt"] - shift).dt.floor(f"{minutes}min")
+    out = (
         df.groupby(key)
         .agg(
-            date=("date", "last"),
             open=("open", "first"),
             high=("high", "max"),
             low=("low", "min"),
             close=("close", "last"),
             volume=("volume", "sum"),
         )
-        .reset_index(drop=True)
+        .reset_index()
+        .rename(columns={"dt": "date"})
     )
+    return out
+
+
+# ---------------------------------------------------------------
+# 日線以上的重組
+# ---------------------------------------------------------------
+def _agg(g):
+    return g.agg(
+        date=("date", "last"),
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+    )
+
+
+def resample(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if rule == "D" or df.empty:
+        return df
+    if rule == "3D":
+        # 從最新一天往回，每 3 個交易日合成一根（最新一根一定是完整的 3 日）
+        idx = pd.Series(range(len(df)), index=df.index)
+        grp = (len(df) - 1 - idx) // 3
+        return _agg(df.groupby(grp)).sort_values("date").reset_index(drop=True)
+    key = df["date"].dt.to_period("W-FRI" if rule == "W" else "M")
+    return _agg(df.groupby(key)).reset_index(drop=True)
 
 
 # ---------------------------------------------------------------
@@ -96,8 +179,15 @@ with st.sidebar:
         help="上市、上櫃都直接輸入代號，例如 2330、0050、6488",
     ).strip()
 
-    period_label = st.selectbox("週期", list(PERIODS.keys()), index=0)
-    years = st.slider("資料年數", 1, 10, 3)
+    period_label = st.selectbox("週期", list(PERIODS.keys()), index=3)
+    period_key = PERIODS[period_label]
+    is_intraday = period_key in INTRADAY
+
+    if is_intraday:
+        kbar_days = st.slider("分K 天數（交易日）", 1, 20, 5)
+        st.caption("分K 需要 FinMind 付費權限，且必須填入 Token。")
+    else:
+        years = st.slider("資料年數", 1, 10, 3)
 
     main_sel = st.multiselect("主圖指標", list(MAIN_INDICATORS.keys()), default=["均線 MA"])
     sub_sel = st.multiselect("副圖指標", list(SUB_INDICATORS.keys()), default=["成交量", "KD (KDJ)"])
@@ -107,10 +197,10 @@ with st.sidebar:
     height = st.slider("圖表高度 (px)", 500, 1100, 760, 20)
 
     token = st.text_input(
-        "FinMind Token（選填）",
+        "FinMind Token（日K 選填、分K 必填）",
         value=DEFAULT_TOKEN,
         type="password",
-        help="不填也能用，但每小時請求次數較少。也可放在 Streamlit secrets：FINMIND_TOKEN",
+        help="也可放在 Streamlit secrets：FINMIND_TOKEN",
     ).strip()
 
 # ---------------------------------------------------------------
@@ -120,10 +210,17 @@ if not code:
     st.info("請在左側輸入股票代號。")
     st.stop()
 
-start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
+if is_intraday and not token:
+    st.warning("分K 資料需要 FinMind Token，請在左側填入，或改選日 K 以上的週期。")
+    st.stop()
+
+if is_intraday:
+    daily_start = (pd.Timestamp.today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+else:
+    daily_start = (pd.Timestamp.today() - pd.DateOffset(years=years)).strftime("%Y-%m-%d")
 
 try:
-    daily = load_price(code, start, token)
+    daily = load_price(code, daily_start, token)
 except Exception as e:
     st.error(f"讀取 {code} 失敗：{e}")
     st.stop()
@@ -132,12 +229,26 @@ if daily.empty:
     st.warning(f"查無 {code} 的資料，請確認代號是否正確。")
     st.stop()
 
-name = load_name(code, token)
-df = resample(daily, PERIODS[period_label])
+if is_intraday:
+    try:
+        with st.spinner("讀取 FinMind 分K 資料中…"):
+            raw = load_kbar(code, kbar_days, token)
+    except Exception as e:
+        st.error(f"讀取 {code} 分K 失敗：{e}\n\n分K 資料集通常需要 FinMind 付費會員權限，請確認 Token 的等級。")
+        st.stop()
+    if raw.empty:
+        st.warning(f"查無 {code} 的分K 資料。")
+        st.stop()
+    df = to_intraday_bars(raw, INTRADAY[period_key])
+else:
+    df = resample(daily, period_key)
 
-# 標題與最新報價
+name = load_name(code, token)
+
+# 標題與最新報價（用日線）
 st.title(f"{code} {name}".strip())
-last, prev = daily.iloc[-1], daily.iloc[-2] if len(daily) > 1 else daily.iloc[-1]
+last = daily.iloc[-1]
+prev = daily.iloc[-2] if len(daily) > 1 else daily.iloc[-1]
 chg = last["close"] - prev["close"]
 pct = chg / prev["close"] * 100 if prev["close"] else 0
 c1, c2, c3, c4 = st.columns(4)
@@ -232,7 +343,7 @@ html = """
     try {
       klinecharts.registerLocale('zh-TW', {
         time: '時間：', open: '開：', high: '高：', low: '低：', close: '收：',
-        volume: '量(張)：', turnover: '成交額：', change: '漲跌：'
+        volume: '量：', turnover: '成交額：', change: '漲跌：'
       });
     } catch (e) {}
 
@@ -287,4 +398,7 @@ for k, v in replacements.items():
     html = html.replace(k, v)
 
 components.html(html, height=height + 6, scrolling=False)
-st.caption("資料來源：FinMind（日線，成交量單位為張）。畫線工具：點上方按鈕後在圖上點選位置即可。")
+st.caption(
+    "資料來源：FinMind。日K 以上成交量單位為張；分K 成交量沿用 FinMind 回傳值。"
+    "畫線工具：點上方按鈕後在圖上點選位置即可。"
+)
