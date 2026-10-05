@@ -1,4 +1,5 @@
 import json
+import time
 
 import pandas as pd
 import requests
@@ -116,6 +117,66 @@ def load_kbar(code: str, ndays: int, token: str) -> pd.DataFrame:
     return df[(df["open"] > 0) & (df["close"] > 0)]
 
 
+# ---------------------------------------------------------------
+# 分K 資料（Yahoo Finance，免費；1分 最多約 5 個交易日，30/60 分 約 60 天）
+# ---------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def load_yahoo_intraday(code: str, interval: str, ndays: int) -> pd.DataFrame:
+    cap = 7 if interval == "1m" else 59
+    calendar_days = min(int(ndays * 1.6) + 3, cap)
+    now = int(time.time())
+    p1 = now - calendar_days * 86400
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+    last_err = ""
+    for suffix in (".TW", ".TWO"):  # 上市 .TW、上櫃 .TWO
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{code}{suffix}"
+        params = {"interval": interval, "period1": p1, "period2": now, "includePrePost": "false"}
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        if r.status_code == 429:
+            raise RuntimeError("Yahoo 暫時限制請求（429），請稍後再試")
+        try:
+            j = r.json()
+        except Exception:
+            last_err = f"HTTP {r.status_code}"
+            continue
+        chart = j.get("chart", {})
+        res = chart.get("result")
+        if not res:
+            last_err = (chart.get("error") or {}).get("description", "查無資料")
+            continue
+        res = res[0]
+        ts = res.get("timestamp") or []
+        quote = (res.get("indicators", {}).get("quote") or [{}])[0]
+        if not ts or not quote:
+            last_err = "查無資料"
+            continue
+        n = len(ts)
+        df = pd.DataFrame(
+            {
+                "ts": ts,
+                "open": quote.get("open") or [None] * n,
+                "high": quote.get("high") or [None] * n,
+                "low": quote.get("low") or [None] * n,
+                "close": quote.get("close") or [None] * n,
+                "volume": quote.get("volume") or [None] * n,
+            }
+        ).dropna(subset=["open", "high", "low", "close"])
+        if df.empty:
+            continue
+        df["date"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+        df["volume"] = df["volume"].fillna(0) / 1000  # 股 → 張
+        df = df[["date", "open", "high", "low", "close", "volume"]].sort_values("date").reset_index(drop=True)
+        # 只保留最近 ndays 個交易日
+        days = df["date"].dt.normalize().drop_duplicates().tolist()[-ndays:]
+        return df[df["date"].dt.normalize().isin(days)].reset_index(drop=True)
+    raise RuntimeError(last_err or "查無資料")
+
+
 def to_intraday_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
     if df.empty:
         return df
@@ -184,8 +245,15 @@ with st.sidebar:
     is_intraday = period_key in INTRADAY
 
     if is_intraday:
+        kbar_source_label = st.selectbox(
+            "分K 資料來源", ["Yahoo Finance（免費）", "FinMind（需 Sponsor 付費）"], index=0
+        )
+        kbar_source = "yahoo" if kbar_source_label.startswith("Yahoo") else "finmind"
         kbar_days = st.slider("分K 天數（交易日）", 1, 20, 5)
-        st.caption("分K 需要 FinMind 付費權限，且必須填入 Token。")
+        if kbar_source == "yahoo":
+            st.caption("Yahoo 的 1 分K 最多約 5 個交易日，30 / 60 分約 60 天；報價可能延遲約 20 分鐘。")
+        else:
+            st.caption("FinMind 分K 需要 Sponsor 等級的 Token。")
     else:
         years = st.slider("資料年數", 1, 10, 3)
 
@@ -210,8 +278,8 @@ if not code:
     st.info("請在左側輸入股票代號。")
     st.stop()
 
-if is_intraday and not token:
-    st.warning("分K 資料需要 FinMind Token，請在左側填入，或改選日 K 以上的週期。")
+if is_intraday and kbar_source == "finmind" and not token:
+    st.warning("FinMind 分K 需要 Token，請在左側填入，或改用 Yahoo Finance 資料來源。")
     st.stop()
 
 if is_intraday:
@@ -229,7 +297,14 @@ if daily.empty:
     st.warning(f"查無 {code} 的資料，請確認代號是否正確。")
     st.stop()
 
-if is_intraday:
+if is_intraday and kbar_source == "yahoo":
+    try:
+        with st.spinner("讀取 Yahoo Finance 分K 資料中…"):
+            df = load_yahoo_intraday(code, period_key, kbar_days)
+    except Exception as e:
+        st.error(f"讀取 {code} 分K 失敗：{e}\n\nYahoo 偶爾會擋雲端主機，可稍後重試，或改選日 K 以上的週期。")
+        st.stop()
+elif is_intraday:
     try:
         with st.spinner("讀取 FinMind 分K 資料中…"):
             raw = load_kbar(code, kbar_days, token)
@@ -399,6 +474,6 @@ for k, v in replacements.items():
 
 components.html(html, height=height + 6, scrolling=False)
 st.caption(
-    "資料來源：FinMind。日K 以上成交量單位為張；分K 成交量沿用 FinMind 回傳值。"
+    "資料來源：日K 以上為 FinMind；分K 依側邊欄選擇（Yahoo Finance 或 FinMind）。成交量單位為張。"
     "畫線工具：點上方按鈕後在圖上點選位置即可。"
 )
