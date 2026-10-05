@@ -121,9 +121,7 @@ def load_kbar(code: str, ndays: int, token: str) -> pd.DataFrame:
 # 分K 資料（Yahoo Finance，免費；1分 最多約 5 個交易日，30/60 分 約 60 天）
 # ---------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
-def load_yahoo_intraday(code: str, interval: str, ndays: int) -> pd.DataFrame:
-    cap = 7 if interval == "1m" else 59
-    calendar_days = min(int(ndays * 1.6) + 3, cap)
+def yahoo_fetch(code: str, interval: str, calendar_days: int) -> pd.DataFrame:
     now = int(time.time())
     p1 = now - calendar_days * 86400
     headers = {
@@ -170,11 +168,32 @@ def load_yahoo_intraday(code: str, interval: str, ndays: int) -> pd.DataFrame:
             continue
         df["date"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
         df["volume"] = df["volume"].fillna(0) / 1000  # 股 → 張
-        df = df[["date", "open", "high", "low", "close", "volume"]].sort_values("date").reset_index(drop=True)
-        # 只保留最近 ndays 個交易日
-        days = df["date"].dt.normalize().drop_duplicates().tolist()[-ndays:]
-        return df[df["date"].dt.normalize().isin(days)].reset_index(drop=True)
+        return df[["date", "open", "high", "low", "close", "volume"]].sort_values("date").reset_index(drop=True)
     raise RuntimeError(last_err or "查無資料")
+
+
+def load_yahoo_intraday(code: str, interval: str, ndays: int) -> pd.DataFrame:
+    cap = 7 if interval == "1m" else 59
+    calendar_days = min(int(ndays * 1.6) + 3, cap)
+    df = yahoo_fetch(code, interval, calendar_days)
+    # 只保留最近 ndays 個交易日
+    days = df["date"].dt.normalize().drop_duplicates().tolist()[-ndays:]
+    return df[df["date"].dt.normalize().isin(days)].reset_index(drop=True)
+
+
+def merge_today(daily: pd.DataFrame, code: str):
+    """FinMind 日線收盤後才更新；若缺最新交易日，用 Yahoo 日線補上（盤中約延遲 20 分鐘）。"""
+    try:
+        y = yahoo_fetch(code, "1d", 10)
+    except Exception:
+        return daily, False
+    y = y.copy()
+    y["date"] = y["date"].dt.normalize()
+    y = y.drop_duplicates("date", keep="last")
+    newer = y[y["date"] > daily["date"].max()]
+    if newer.empty:
+        return daily, False
+    return pd.concat([daily, newer], ignore_index=True), True
 
 
 def to_intraday_bars(df: pd.DataFrame, minutes: int) -> pd.DataFrame:
@@ -297,6 +316,8 @@ if daily.empty:
     st.warning(f"查無 {code} 的資料，請確認代號是否正確。")
     st.stop()
 
+daily, patched = merge_today(daily, code)
+
 if is_intraday and kbar_source == "yahoo":
     try:
         with st.spinner("讀取 Yahoo Finance 分K 資料中…"):
@@ -322,6 +343,8 @@ name = load_name(code, token)
 
 # 標題與最新報價（用日線）
 st.title(f"{code} {name}".strip())
+if patched:
+    st.caption("最新交易日資料來自 Yahoo Finance（盤中約延遲 20 分鐘）；FinMind 收盤後更新完成就會改用 FinMind。")
 last = daily.iloc[-1]
 prev = daily.iloc[-2] if len(daily) > 1 else daily.iloc[-1]
 chg = last["close"] - prev["close"]
