@@ -461,13 +461,54 @@ html = """
       chart.createIndicator(name, false, { height: 110 });
     });
 
+    // ---- 畫線持久化：依股票代號存，與週期無關（以「時間 + 價格」定位）----
+    const STORE_KEY = 'tvdraw_' + __CODE__;
+    const reg = {};
+    function loadSaved() {
+      try { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); } catch (e) { return []; }
+    }
+    function persist() {
+      try { localStorage.setItem(STORE_KEY, JSON.stringify(Object.values(reg))); } catch (e) {}
+    }
+    function snap(o) {
+      return {
+        id: o.id,
+        name: o.name,
+        points: (o.points || []).map(function (p) { return { timestamp: p.timestamp, value: p.value }; })
+      };
+    }
+    function handlers() {
+      return {
+        onDrawEnd: function (e) { reg[e.overlay.id] = snap(e.overlay); persist(); return false; },
+        onPressedMoveEnd: function (e) { reg[e.overlay.id] = snap(e.overlay); persist(); return false; },
+        onRemoved: function (e) { delete reg[e.overlay.id]; persist(); return false; },
+        onRightClick: function (e) { chart.removeOverlay({ id: e.overlay.id }); return true; }
+      };
+    }
+
+    loadSaved().forEach(function (o) {
+      try {
+        reg[o.id] = o;
+        const cfg = handlers();
+        cfg.id = o.id;
+        cfg.name = o.name;
+        cfg.points = o.points;
+        chart.createOverlay(cfg);
+      } catch (e) {}
+    });
+
     document.querySelectorAll('.tb[data-ov]').forEach(function (btn) {
       btn.addEventListener('click', function () {
-        chart.createOverlay(btn.getAttribute('data-ov'));
+        const cfg = handlers();
+        cfg.name = btn.getAttribute('data-ov');
+        cfg.id = 'o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        chart.createOverlay(cfg);
       });
     });
     document.getElementById('clear').addEventListener('click', function () {
       chart.removeOverlay();
+      Object.keys(reg).forEach(function (k) { delete reg[k]; });
+      persist();
     });
 
     window.addEventListener('resize', function () { chart.resize(); });
@@ -491,6 +532,7 @@ replacements = {
     "__SUB__": json.dumps(sub_list),
     "__THEME__": theme,
     "__STYLES__": json.dumps(styles),
+    "__CODE__": json.dumps(code),
 }
 for k, v in replacements.items():
     html = html.replace(k, v)
@@ -498,5 +540,5 @@ for k, v in replacements.items():
 components.html(html, height=height + 6, scrolling=False)
 st.caption(
     "資料來源：日K 以上為 FinMind；分K 依側邊欄選擇（Yahoo Finance 或 FinMind）。成交量單位為張。"
-    "畫線工具：點上方按鈕後在圖上點選位置即可。"
+    "畫線工具：點上方按鈕後在圖上點選位置即可；線依股票代號保存在這個瀏覽器，切換週期仍在，右鍵點線可刪除。"
 )
