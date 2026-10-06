@@ -24,14 +24,16 @@ POPULAR = {
 # 週期：分K 需要 FinMind 付費權限；日K 以上免費
 PERIODS = {
     "1 分": "1m",
+    "15 分": "15m",
     "30 分": "30m",
     "60 分": "60m",
+    "180 分": "180m",
     "日 K": "D",
     "3 日 K": "3D",
     "週 K": "W",
     "月 K": "M",
 }
-INTRADAY = {"1m": 1, "30m": 30, "60m": 60}
+INTRADAY = {"1m": 1, "15m": 15, "30m": 30, "60m": 60, "180m": 180}
 
 # 主圖疊加指標 / 副圖指標（KLineChart 內建名稱）
 MAIN_INDICATORS = {"均線 MA": "MA", "均線 EMA": "EMA", "布林通道": "BOLL"}
@@ -173,9 +175,12 @@ def yahoo_fetch(code: str, interval: str, calendar_days: int) -> pd.DataFrame:
 
 
 def load_yahoo_intraday(code: str, interval: str, ndays: int) -> pd.DataFrame:
-    cap = 7 if interval == "1m" else 59
+    base = "60m" if interval == "180m" else interval  # Yahoo 沒有 180 分，用 60 分合成
+    cap = 7 if base == "1m" else 59
     calendar_days = min(int(ndays * 1.6) + 3, cap)
-    df = yahoo_fetch(code, interval, calendar_days)
+    df = yahoo_fetch(code, base, calendar_days)
+    if interval == "180m":
+        df = to_intraday_bars(df.rename(columns={"date": "dt"}), 180)
     # 只保留最近 ndays 個交易日
     days = df["date"].dt.normalize().drop_duplicates().tolist()[-ndays:]
     return df[df["date"].dt.normalize().isin(days)].reset_index(drop=True)
@@ -259,7 +264,7 @@ with st.sidebar:
         help="上市、上櫃都直接輸入代號，例如 2330、0050、6488",
     ).strip()
 
-    period_label = st.selectbox("週期", list(PERIODS.keys()), index=3)
+    period_label = st.selectbox("週期", list(PERIODS.keys()), index=5)
     period_key = PERIODS[period_label]
     is_intraday = period_key in INTRADAY
 
@@ -270,7 +275,7 @@ with st.sidebar:
         kbar_source = "yahoo" if kbar_source_label.startswith("Yahoo") else "finmind"
         kbar_days = st.slider("分K 天數（交易日）", 1, 20, 5)
         if kbar_source == "yahoo":
-            st.caption("Yahoo 的 1 分K 最多約 5 個交易日，30 / 60 分約 60 天；報價可能延遲約 20 分鐘。")
+            st.caption("Yahoo 的 1 分K 最多約 5 個交易日，15 / 30 / 60 / 180 分約 60 天；報價可能延遲約 20 分鐘。")
         else:
             st.caption("FinMind 分K 需要 Sponsor 等級的 Token。")
     else:
